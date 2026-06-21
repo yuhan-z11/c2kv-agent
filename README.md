@@ -227,7 +227,7 @@ ids_a + ids_b_truncated + ids_c → model.model() → Loss
 
 5. **多轮自然覆盖**：由于 input_parsed 包含完整累积历史，一次 span 内就能覆盖多轮 tool_call_response 的压缩效果，无需跨 spans 收集。
 
-### 3.5 实验结果
+### 实验结果
 
 **采样 100 条样本**（中间随机决策点）：
 
