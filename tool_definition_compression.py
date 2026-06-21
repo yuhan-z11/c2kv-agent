@@ -1,5 +1,5 @@
 """
-Agent Tool Definition 压缩实验脚本 (严格版：取中间决策点)
+Agent Tool Definition 压缩实验脚本
 =====================================================================
 核心逻辑：
   每个 trace 有多个 spans（多轮 LLM 调用），每个 span 的 input 包含从第一轮到
@@ -394,90 +394,138 @@ def run_truncation(tokenizer, model, sample: dict, truncate_ratio: int) -> dict:
 
 @torch.inference_mode()
 def run_c2kv(tokenizer, model, sample: dict, gist_ratio: int) -> dict:
-    """C2KV 模式: 仅压缩 Tool Definitions（逐段处理，严格 RoPE 对齐版）"""
+    """C2KV 模式: 严格按时间线，只压缩 Tool Definitions"""
     device = _get_device(model)
-    ids_a, ids_b, ids_c = get_tokenized_blocks(sample, tokenizer)
-    if len(ids_a) == 0:
-        return run_full(tokenizer, model, sample)
 
-    # ---- Step 1: 按 token 数切分 ----
-    MAX_SEG_TOKENS = 2048
-    segment_ids = []
-    for i in range(0, len(ids_a), MAX_SEG_TOKENS):
-        segment_ids.append(ids_a[i:i + MAX_SEG_TOKENS])
+    # ---- 1. 按时间线构建 Chunks ----
+    chunks = []
 
-    original_tool_tokens = len(ids_a)
+    # Block A: Tool Definitions (标记为 tool_def 类型，走 gist 压缩)
+    ids_a = tokenizer.encode(sample["tool_definitions"], add_special_tokens=True)
+    chunks.append({"type": "tool_def", "ids": ids_a})
 
-    # ---- Step 2: 逐段 generate_gist +  RoPE 对齐 ----
-    context_cache = None
-    gist_token_total = 0
-    original_accumulated = 0  
+    # Block B: 完整对话历史（全部 normal，不做压缩）
+    for msg in sample.get("input_parsed", []):
+        role = msg.get("role", "user")
+        chunks.append({"type": "normal", "ids": tokenizer.encode(f"<|im_start|>{role}\n", add_special_tokens=False)})
+        for part in msg.get("parts", []):
+            if part.get("type") == "tool_call_response":
+                chunks.append({"type": "normal", "ids": tokenizer.encode(json.dumps(part.get("result", []), ensure_ascii=False), add_special_tokens=False)})
+            elif part.get("type") == "tool_call":
+                chunks.append({"type": "normal", "ids": tokenizer.encode(json.dumps({k: v for k, v in part.items() if k in ("name", "arguments")}, ensure_ascii=False), add_special_tokens=False)})
+            else:
+                chunks.append({"type": "normal", "ids": tokenizer.encode(part.get("content", ""), add_special_tokens=False)})
+        chunks.append({"type": "normal", "ids": tokenizer.encode("<|im_end|>\n", add_special_tokens=False)})
 
-    for seg_ids in segment_ids:
-        if not seg_ids:
+    # Target
+    try:
+        outputs = json.loads(sample["output_text"])
+        tool_texts = []
+        for msg in outputs:
+            for part in msg.get("parts", []):
+                if part.get("type") == "tool_call":
+                    tc = {"name": part.get("name", ""), "arguments": part.get("arguments", {})}
+                    tool_texts.append(json.dumps(tc, ensure_ascii=False))
+        target_text = "\n".join(tool_texts) if tool_texts else " ".join([p.get("content", "") for m in outputs for p in m.get("parts", []) if p.get("type") == "text"])
+    except:
+        target_text = sample["output_text"]
+    ids_c = tokenizer.encode("<|im_start|>assistant\n" + target_text + "<|im_end|>\n", add_special_tokens=False)
+
+    # ---- 2. 合并连续同类型 chunk + 收集信息 ----
+    merged = []
+    for ch in chunks:
+        if not ch["ids"]:
             continue
-
-        tensor_seg = torch.tensor([seg_ids], device=device)
-        attn_seg = torch.ones_like(tensor_seg)
-        model.model.config._attn_implementation = "sdpa"
-        out_seg, gist_mask_seg, pos_ids_seg = model.model.generate_gist(
-            tensor_seg, attn_seg, ratio=gist_ratio)
-        pos_ids_seg = pos_ids_seg[:, -gist_mask_seg.shape[1]:]
-
-        # prefix_length 必须是原文本的逻辑长度，这样才能让后续段落的 RoPE 跨度接续正确
-        prefix = original_accumulated
-        
-        seg_cache, _ = blend_gist_key_values(
-            model.config, [out_seg.past_key_values], [gist_mask_seg], [pos_ids_seg],
-            model.model.rotary_emb, prefix_length=prefix)
-        del out_seg
-
-        if context_cache is None:
-            context_cache = seg_cache
+        if not merged or merged[-1]["type"] != ch["type"]:
+            merged.append({"type": ch["type"], "ids": ch["ids"][:]})
         else:
-            for layer_i in range(len(seg_cache.layers)):
-                k_new = torch.cat([context_cache.layers[layer_i].keys,
-                                   seg_cache.layers[layer_i].keys], dim=-2)
-                v_new = torch.cat([context_cache.layers[layer_i].values,
-                                   seg_cache.layers[layer_i].values], dim=-2)
-                context_cache.layers[layer_i].keys = k_new
-                context_cache.layers[layer_i].values = v_new
-        del seg_cache
-        gist_token_total += int(gist_mask_seg.sum().item())
-        original_accumulated += len(seg_ids) # 累加原始 Token 数
+            merged[-1]["ids"].extend(ch["ids"])
+
+    normal_ids_list = []   # [(ids, position_start)]
+    tool_def_chunks = []   # [(ids, position_start)]
+    pos = 0
+    for ch in merged:
+        ids = ch["ids"]
+        if not ids:
+            continue
+        if ch["type"] == "normal":
+            normal_ids_list.append((ids, pos))
+            pos += len(ids)
+        elif ch["type"] == "tool_def":
+            tool_def_chunks.append((ids, pos))
+            pos += len(ids)
+
+    # ---- 3. forward：normal 合并一次，tool_def 逐个 gist ----
+    t0 = time.time()
+
+    # Normal: 所有 normal ids 拼成一条，一次 forward
+    normal_concat = []
+    for ids, _ in normal_ids_list:
+        normal_concat.extend(ids)
+    if normal_concat:
+        tensor_n = torch.tensor([normal_concat], device=device)
+        out_n = model.model(input_ids=tensor_n, use_cache=True)
+        normal_cache = out_n.past_key_values
+        del out_n
+    else:
+        normal_cache = None
+
+    # Tool Defs: 按 2048 切分后逐个 generate_gist
+    tool_caches = []
+    for to_ids, pos_start in tool_def_chunks:
+        if not to_ids:
+            continue
+        MAX_SEG = 2048
+        for i in range(0, len(to_ids), MAX_SEG):
+            sub_ids = to_ids[i:i + MAX_SEG]
+            tensor_seg = torch.tensor([sub_ids], device=device)
+            attn_seg = torch.ones_like(tensor_seg)
+            model.model.config._attn_implementation = "sdpa"
+            out_seg, gist_mask_seg, pos_ids_seg = model.model.generate_gist(
+                tensor_seg, attn_seg, ratio=gist_ratio)
+            pos_ids_seg = pos_ids_seg[:, -gist_mask_seg.shape[1]:]
+            seg_cache, _ = blend_gist_key_values(
+                model.config, [out_seg.past_key_values], [gist_mask_seg], [pos_ids_seg],
+                model.model.rotary_emb, prefix_length=pos_start + i)
+            tool_caches.append(seg_cache)
+            del out_seg, seg_cache
+
+    # 拼接 total cache = normal_kv + tool_def_gist_kv
+    if normal_cache is not None:
+        merged_cache = normal_cache
+        for tc in tool_caches:
+            for li in range(len(merged_cache.layers)):
+                merged_cache.layers[li].keys = torch.cat([merged_cache.layers[li].keys, tc.layers[li].keys], dim=-2)
+                merged_cache.layers[li].values = torch.cat([merged_cache.layers[li].values, tc.layers[li].values], dim=-2)
+    elif tool_caches:
+        merged_cache = tool_caches[0]
+        for tc in tool_caches[1:]:
+            for li in range(len(merged_cache.layers)):
+                merged_cache.layers[li].keys = torch.cat([merged_cache.layers[li].keys, tc.layers[li].keys], dim=-2)
+                merged_cache.layers[li].values = torch.cat([merged_cache.layers[li].values, tc.layers[li].values], dim=-2)
+    else:
+        return run_full(tokenizer, model, sample)
 
     gc.collect()
     torch.cuda.empty_cache()
 
-    # ---- Step 3: 携带 cache 计算完整历史 + Target ----
-    # 历史对话和 Target 的 Position ID 必须紧跟着原始工具总长度
-    precompute_length = original_tool_tokens  
-    query_ids = ids_b + ids_c
-    query_tensor = torch.tensor([query_ids], device=device)
-    pos_query = torch.arange(precompute_length,
-                             precompute_length + len(query_ids),
-                             dtype=torch.long, device=device).unsqueeze(0)
+    # ---- 4. 使用拼装好的 Cache 预测 Target ----
+    tensor_c = torch.tensor([ids_c], device=device)
+    pos_c = torch.arange(pos, pos + len(ids_c), dtype=torch.long, device=device).unsqueeze(0)
 
-    t0 = time.time()
-    outputs = model.model(
-        input_ids=query_tensor,
-        position_ids=pos_query,
-        past_key_values=context_cache,
-        use_cache=False,
-    )
+    outputs_tgt = model.model(
+        input_ids=tensor_c, position_ids=pos_c, past_key_values=merged_cache, use_cache=False)
     gen_time = time.time() - t0
 
-    L_b = len(ids_b)
-    shift_hidden = outputs[0][0, L_b:-1, :].contiguous()
+    shift_hidden = outputs_tgt[0][0, :-1, :].contiguous()
     shift_labels = torch.tensor(ids_c[1:], device=device).contiguous()
     loss_val = compute_nll_loss(model.lm_head(shift_hidden), shift_labels)
 
+    gist_total = sum(int(tc.layers[0].keys.shape[-2]) for tc in tool_caches) if tool_caches else 0
     return {
-        "mode": f"c2kv_{gist_ratio}x", "loss": round(loss_val, 4),
-        "ppl": round(math.exp(loss_val), 4),
-        "original_tool_tokens": original_tool_tokens,
-        "gist_tokens": gist_token_total,
-        "compression_ratio": round(original_tool_tokens / max(gist_token_total, 1), 2),
+        "mode": f"c2kv_{gist_ratio}x", "loss": round(loss_val, 4), "ppl": round(math.exp(loss_val), 4),
+        "original_tool_tokens": len(ids_a), "gist_tokens": gist_total,
+        "compression_ratio": round(len(ids_a) / max(gist_total, 1), 2),
         "time_s": round(gen_time, 3), "target_tokens": len(shift_labels),
     }
 
