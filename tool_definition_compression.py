@@ -1,5 +1,5 @@
 """
-Agent Tool Definition 压缩实验脚本
+Agent Tool Definition 压缩实验脚本 
 =====================================================================
 核心逻辑：
   每个 trace 有多个 spans（多轮 LLM 调用），每个 span 的 input 包含从第一轮到
@@ -54,12 +54,15 @@ BLACKLIST_TOOLS = {
 }
 
 
-def extract_samples(max_samples_per_benchmark: int = 30) -> list[dict]:
+def extract_samples(max_samples_per_benchmark: int = 30,
+                    max_tooldef_tokens: int = None,
+                    tokenizer=None) -> list[dict]:
     """
     每个 trace 从中间（20%~80% 时间范围）随机采样一个 span 作为测试点。
     筛选要求：
       - input 中包含 tool_call_response
       - target 不是 blacklist 中的模板化工具
+      - (可选) tool definitions 的实际 token 数不超过 max_tooldef_tokens
     """
     files = sorted(glob.glob(os.path.join(DATA_DIR, "train-*.parquet")))
     print(f"Scanning {len(files)} parquet files for test samples...")
@@ -84,6 +87,13 @@ def extract_samples(max_samples_per_benchmark: int = 30) -> list[dict]:
                 output_str = attrs.get("gen_ai.output.messages", "")
                 if not (tool_def_str and input_str and output_str):
                     continue
+
+                # 可选：筛掉长 tool definitions（基于实际 token 数）
+                if max_tooldef_tokens is not None and tokenizer is not None:
+                    td_tokens = len(tokenizer.encode(tool_def_str, add_special_tokens=True))
+                    if td_tokens > max_tooldef_tokens:
+                        continue
+
                 try:
                     inputs = json.loads(input_str)
                     outputs = json.loads(output_str)
@@ -534,7 +544,15 @@ def run_c2kv(tokenizer, model, sample: dict, gist_ratio: int) -> dict:
 # ---------------------------------------------------------------------------
 
 def evaluate(args):
-    samples = extract_samples(args.max_samples_per_benchmark)
+    # 如果需要按 token 数筛选，先加载 tokenizer 用于 extract_samples
+    if args.max_tooldef_tokens is not None:
+        tokenizer = AutoTokenizer.from_pretrained(args.checkpoint, local_files_only=True)
+    else:
+        tokenizer = None
+
+    samples = extract_samples(args.max_samples_per_benchmark,
+                              max_tooldef_tokens=args.max_tooldef_tokens,
+                              tokenizer=tokenizer)
     if args.max_examples:
         samples = samples[:args.max_examples]
 
@@ -643,6 +661,8 @@ if __name__ == "__main__":
                         default=[2, 4, 8])
     parser.add_argument("--gist_ratios", type=int, nargs="+",
                         default=[2, 4, 8])
+    parser.add_argument("--max_tooldef_tokens", type=int, default=None,
+                        help="Filter samples with tool definitions <= this many tokens (char-based: tokens*4)")
     parser.add_argument("--log_samples", action="store_true",
                         help="Dump detailed sample logs to agent/output/")
     parser.add_argument("--log_prefix", type=str, default="",
